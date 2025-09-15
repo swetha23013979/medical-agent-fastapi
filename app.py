@@ -40,7 +40,7 @@ app.add_middleware(
 
 class Config:
     def __init__(self):
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyBZNWhMXa9SG0WDKbK5uhLc5ewxFmOyH_Y")
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyCpbtZZpEUdf9CjTHRP--aHO63Y6OAYNWk")
         self.model_name = "models/embedding-001"
         self.chat_model = "gemini-2.0-flash"
         self.chroma_db_path = "./chroma_db"
@@ -293,5 +293,6 @@ async def clear_all_sessions():
 
 if __name__ == "__main__":
     import uvicorn
+
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
