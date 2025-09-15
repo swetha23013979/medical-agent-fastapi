@@ -18,9 +18,10 @@ from langchain.agents import Tool, AgentExecutor, create_react_agent
 from langchain import hub
 from langchain.schema import Document
 
-# Gemini imports
+# Gemini + fallback imports
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,17 +76,26 @@ class MedicalAssistant:
         try:
             logger.info("Initializing Medical Assistant...")
 
-            # Initialize Gemini models
+            # Initialize Gemini chat model
             self.llm = ChatGoogleGenerativeAI(
                 model=self.config.chat_model,
                 google_api_key=self.config.gemini_api_key,
                 temperature=self.config.temperature,
             )
 
-            self.embedding_model = GoogleGenerativeAIEmbeddings(
-                model=self.config.model_name,
-                google_api_key=self.config.gemini_api_key
-            )
+            # Try Gemini embeddings, fallback to HuggingFace if quota fails
+            try:
+                logger.info("Trying Gemini embeddings...")
+                self.embedding_model = GoogleGenerativeAIEmbeddings(
+                    model=self.config.model_name,
+                    google_api_key=self.config.gemini_api_key
+                )
+                # quick test call
+                _ = self.embedding_model.embed_query("test")
+                logger.info("Gemini embeddings initialized successfully")
+            except Exception as e:
+                logger.warning(f"Gemini embeddings failed ({e}), falling back to HuggingFace.")
+                self.embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
             # Load and process dataset
             await self._load_and_process_data()
@@ -105,7 +115,7 @@ class MedicalAssistant:
             # Load dataset
             data = load_dataset("keivalya/MedQuad-MedicalQnADataset", split='train')
             data = data.to_pandas()
-            data = data.head(100)  # Limit for demo
+            data = data.head(50)  # reduce rows for demo to save embeddings
 
             # Create documents
             df_loader = DataFrameLoader(data, page_content_column="Answer")
@@ -118,12 +128,20 @@ class MedicalAssistant:
             )
             texts = text_splitter.split_documents(documents)
 
-            # Create vector store
-            self.vector_db = Chroma.from_documents(
-                documents=texts,
-                embedding=self.embedding_model,
-                persist_directory=self.config.chroma_db_path
-            )
+            # Load existing Chroma DB if available
+            if os.path.exists(self.config.chroma_db_path):
+                logger.info("Loading existing Chroma DB...")
+                self.vector_db = Chroma(
+                    persist_directory=self.config.chroma_db_path,
+                    embedding_function=self.embedding_model
+                )
+            else:
+                logger.info("Creating new Chroma DB...")
+                self.vector_db = Chroma.from_documents(
+                    documents=texts,
+                    embedding=self.embedding_model,
+                    persist_directory=self.config.chroma_db_path
+                )
 
             logger.info("Data processing completed successfully")
 
@@ -144,7 +162,7 @@ class MedicalAssistant:
                 return_source_documents=True
             )
 
-            # Define tools with wrapper function to handle the dictionary output
+            # Define tools with wrapper function
             def medical_kb_wrapper(query: str) -> str:
                 """Wrapper that extracts just the result from the QA chain output"""
                 result_dict = qa.invoke({"query": query})
@@ -154,21 +172,18 @@ class MedicalAssistant:
                 Tool(
                     name='Medical KB',
                     func=medical_kb_wrapper,
-                    description=(
-                        "Use this tool when answering medical knowledge queries to get "
-                        "more information about the topic. Input should be a medical question."
-                    )
+                    description="Use this tool to answer medical knowledge queries."
                 )
             ]
 
-            # Create memory
+            # Memory
             conversational_memory = ConversationBufferWindowMemory(
                 memory_key='chat_history',
                 k=4,
                 return_messages=True
             )
 
-            # Create agent
+            # Agent
             prompt = hub.pull("hwchase17/react-chat")
             agent = create_react_agent(
                 tools=tools,
@@ -176,7 +191,7 @@ class MedicalAssistant:
                 prompt=prompt,
             )
 
-            # Create agent executor
+            # Executor
             agent_executor = AgentExecutor(
                 agent=agent,
                 tools=tools,
@@ -189,7 +204,6 @@ class MedicalAssistant:
 
             self.agent_executors[session_id] = agent_executor
             logger.info(f"Agent created successfully for session {session_id}")
-
             return agent_executor
 
         except Exception as e:
@@ -241,7 +255,6 @@ medical_assistant = MedicalAssistant()
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    """Handle chat messages via HTTP POST"""
     try:
         response = await medical_assistant.process_message(request.message, request.session_id)
         return ChatResponse(response=response, session_id=request.session_id)
@@ -266,7 +279,6 @@ async def health_check():
 
 @app.post("/sessions/{session_id}/clear")
 async def clear_session_memory(session_id: str):
-    """Clear memory for a specific session"""
     success = await medical_assistant.clear_memory(session_id)
     if success:
         return {"message": f"Conversation memory cleared for session {session_id}"}
@@ -276,7 +288,6 @@ async def clear_session_memory(session_id: str):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """Delete a session completely"""
     success = await medical_assistant.delete_session(session_id)
     if success:
         return {"message": f"Session {session_id} deleted successfully"}
@@ -286,13 +297,10 @@ async def delete_session(session_id: str):
 
 @app.post("/sessions/clear-all")
 async def clear_all_sessions():
-    """Clear all sessions"""
     medical_assistant.agent_executors.clear()
     return {"message": "All sessions cleared successfully"}
 
 
 if __name__ == "__main__":
     import uvicorn
-
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
